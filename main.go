@@ -1,175 +1,247 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-const (
-	maxProjectileV = 600  // meters/sec
-	minProjectileV = 300  // meters/sec
-	maxTargetV     = 60   // kilometers/hour
-	minTargetV     = 0    // kilometers/hour
-	impactRadius   = 20.0 // meters
-	maxShotAngle   = 45.0 // degrees
-	minShotAngle   = 1.0  // degrees
+// -----------------------------------------------------------
+// NOTE:
+//    ALL distance units are METERS except where specified!
+//    ALL angle units are DEGREES except where specified!
+// -----------------------------------------------------------
 
-	gameOverMan = "GAME OVER MAN, you just got crushed by the tank!"
+const (
+	minProjectileVmps  = 300  // meters/sec
+	maxProjectileVmps  = 600  // meters/sec
+	minTargetVkph      = 0    // kilometers/hour
+	maxTargetVkph      = 60   // kilometers/hour
+	impactRadius       = 20.0 // meters
+	minShotAngle       = 1.0  // degrees
+	maxShotAngle       = 45.0 // degrees
+	metersPerKilometer = 1000.0
+	feetPerMile        = 5280.0
+	feetPerMeter       = 3.28084
+	secondsPerHour     = 60.0 * 60.0
+	gravityAmps2       = 9.80665
+
+	flightPath = " /~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+	impactPath = "/--------+---------+---------+---------+---------|"
+	// Ruler      01234567890123456789012345678901234567890123456789
+	gameOverMan = "GAME OVER MAN, you just got crushed by the other tank!"
 )
 
 var (
-	projectileV         float64
-	targetV             float64
-	targetVmps          float64
-	maxRange            float64
-	targetRange         float64
-	deathRadius         float64
-	wg                  sync.WaitGroup
-	playModeAuto        bool // true = Auto Shoot Mode, false = Single Player
-	playModePauseTarget bool // true = target pauses when deciding shot, false = target moves when deciding shot
-	gameSpeed           int  // times faster than real-time
-	englishUnits        bool // true = english units, false = metric units
+	projectileVmps        float64
+	targetVkph            float64
+	targetVmps            float64
+	maxRange              float64
+	targetRange           float64
+	deathRadius           float64
+	wg                    sync.WaitGroup
+	shootModeAuto         bool = false // true = Auto Shoot Mode, false = Manual Shot
+	targetModeAuto        bool = false // true = target moves when deciding shot, false = target pauses when deciding shot
+	targetSpeedMultiplier int          // times faster than real-time
+	englishUnits          bool = false // true = english units, false = metric units
+	printShotProfile      bool = false // true = print the shot profile on startup, false = don't
+	rulerText             string
+
+	englishOrMetric   = map[bool]string{true: "English", false: "Metric"}
+	feetOrMeters      = map[bool]string{true: "feet", false: "meters"}
+	milesOrKilometers = map[bool]string{true: "miles", false: "kilometers"}
 )
 
-func init() {
-	flag.BoolVar(&playModeAuto, "a", false, "Auto Shoot Mode (default - Single Player)")
-	flag.BoolVar(&playModePauseTarget, "p", false, "Pause Target During Shot Decision (default - Realtime Target Movement)")
-	flag.BoolVar(&englishUnits, "e", false, "English Units (default - Metric)")
+func parseFlags() {
+	flag.BoolVar(&shootModeAuto, "a", shootModeAuto, "Auto Shot Mode (default - Manual Shot)")
+	flag.BoolVar(&targetModeAuto, "m", targetModeAuto, "Real-time Target Movement (default - Pause Target During Shot Decision)")
+	flag.BoolVar(&englishUnits, "e", englishUnits, "English Units (default - Metric)")
+	flag.BoolVar(&printShotProfile, "p", printShotProfile, "Print Shot Profile")
 	flag.Float64Var(&deathRadius, "d", impactRadius, "Detonation Radius (meters)")
 	flag.Parse()
-
-	if playModeAuto {
-		fmt.Println("Play Mode: Auto")
-		gameSpeed = 10
-		if playModePauseTarget {
-			fmt.Println("Play Mode: Error: Pause Target During Shot Decision has no efffect during Auto Shot Mode")
-		}
-	} else {
-		fmt.Println("Play Mode: Single Player")
-		gameSpeed = 1
-		if playModePauseTarget {
-			fmt.Println("Play Mode: Pause Target During Shot Decision")
-		} else {
-			fmt.Println("Play Mode: Realtime Target Movement")
-		}
-	}
-
-	if englishUnits {
-		fmt.Println("Units: English")
-	} else {
-		fmt.Println("Units: Metric")
-	}
-
-	fmt.Printf("Detonation Radius = %s\n", getDisplayText(deathRadius))
-
-	rand.Seed(time.Now().UnixNano())
-	projectileV = minProjectileV + float64(rand.Intn(10000))*float64(maxProjectileV-minProjectileV)/10000.0
-	targetV = minTargetV + float64(rand.Intn(10000))*float64(maxTargetV-minTargetV)/10000.0
-	targetVmps = targetV * (1000.0 / 3600.0)
-	maxRange, _ = xRange(45.0, projectileV)
-	targetRange = float64(maxRange*0.2) + float64(rand.Intn(10000))*(maxRange*0.8)/10000.0
 }
 
-func xRange(angle, v float64) (x, t float64) {
-	radians := (2 * math.Pi) * (angle / 360.0)
-	t = (math.Sin(radians) * v) / 4.9
-	x = math.Sin(radians) * t * v
+func getTargetMode(shootModeAuto, targetModeAutoDefault bool) (targetModeAuto bool, targetSpeedMultiplier int) {
+	targetModeAuto = targetModeAutoDefault
+	if shootModeAuto {
+		fmt.Println("Shot Mode: Auto")
+		targetSpeedMultiplier = 10
+		targetModeAuto = true
+	} else {
+		fmt.Println("Shot Mode: Manual")
+		targetSpeedMultiplier = 1
+		if targetModeAuto {
+			fmt.Println("Target Mode: Realtime Target Movement")
+		} else {
+			fmt.Println("Target Mode: Pause Target During Shot Decision")
+		}
+	}
 	return
 }
 
-func getDisplayText(value float64) string {
-	if englishUnits {
-		return fmt.Sprintf("%3.1f feet", value*3.28084)
+func getRandomValue(min, max float64) float64 {
+	return min + float64(rand.Intn(10000))*float64(max-min)/10000.0
+}
+
+func displayShotProfile() {
+	fmt.Println("")
+	fmt.Println("Shot Profile:")
+	fmt.Printf("+-------+------------+-------+\n")
+	fmt.Printf("| Angle | Shot Range | Time  |\n")
+	fmt.Printf("| (deg) | %10s | (sec) |\n", "("+feetOrMeters[englishUnits]+")")
+	fmt.Printf("+-------+------------+-------+\n")
+	for angle := minShotAngle; angle <= maxShotAngle; angle += 1.0 {
+		shotRange, shotTime := xRange(angle, projectileVmps)
+		fmt.Printf("| %5.1f | %10.1f | %5.1f |\n", angle, getFeetOrMeters(shotRange, englishUnits), shotTime)
 	}
-	return fmt.Sprintf("%3.1f meters", value)
+	fmt.Printf("+-------+------------+-------+\n")
+	fmt.Println("")
+}
+
+func initialize() {
+	parseFlags()
+	targetModeAuto, targetSpeedMultiplier = getTargetMode(shootModeAuto, targetModeAuto)
+
+	fmt.Printf("Units: %s\n", englishOrMetric[englishUnits])
+	fmt.Printf("Detonation Radius = %s\n", getDisplayText(deathRadius))
+
+	// Initialize random values.
+	rand.Seed(time.Now().UnixNano())
+	projectileVmps = getRandomValue(minProjectileVmps, maxProjectileVmps)
+	targetVkph = getRandomValue(minTargetVkph, maxTargetVkph)
+	targetVmps = targetVkph * (metersPerKilometer / secondsPerHour)
+	maxRange, _ = xRange(maxShotAngle, projectileVmps)
+	targetRange = getRandomValue(maxRange*0.2, maxRange)
+
+	// Calculate distance markers for the legend undel the timeline.
+	rulerText = fmt.Sprintf("       %5s     %5s     %5s     %5s     %5s",
+		getRulerText(1.0*maxRange/5.0),
+		getRulerText(2.0*maxRange/5.0),
+		getRulerText(3.0*maxRange/5.0),
+		getRulerText(4.0*maxRange/5.0),
+		getRulerText(5.0*maxRange/5.0),
+	)
+	rulerText = rulerText[:len(rulerText)-1] + strings.Title(milesOrKilometers[englishUnits])
+
+	if printShotProfile {
+		displayShotProfile()
+	}
+
+}
+
+func xRange(angle, v float64) (x, t float64) {
+	radians := (2.0 * math.Pi) * (angle / 360.0)
+	t = (math.Sin(radians) * v * 2.0) / gravityAmps2
+	x = math.Cos(radians) * t * v
+	return
+}
+
+func xAngle(x, v float64) float64 {
+	radians := math.Asin((x*gravityAmps2)/(v*v)) / 2.0
+	angle := (radians * 360.0) / (2.0 * math.Pi)
+	return angle
+}
+
+func getMilesOrKilometers(value float64, englishUnits bool) float64 {
+	if englishUnits {
+		return ((value * feetPerMeter) / feetPerMile)
+	}
+	return value / metersPerKilometer
+}
+
+func getRulerText(value float64) string {
+	return fmt.Sprintf("%4.1f%1s", getMilesOrKilometers(value, englishUnits), strings.Title(milesOrKilometers[englishUnits][:1]))
+}
+
+func getFeetOrMeters(value float64, englishUnits bool) float64 {
+	if englishUnits {
+		return value * feetPerMeter
+	}
+	return value
+}
+
+func getDisplayText(value float64) string {
+	return fmt.Sprintf("%3.1f %s", getFeetOrMeters(value, englishUnits), feetOrMeters[englishUnits])
 }
 
 func printHeader() {
 	fmt.Println("==================================")
-	fmt.Printf("Projectile Velocity  = %s/sec\n", getDisplayText(projectileV))
+	fmt.Printf("Projectile Velocity  = %s/sec\n", getDisplayText(projectileVmps))
 	fmt.Printf("Max Projectile Range = %s\n", getDisplayText(maxRange))
-	if englishUnits {
-		fmt.Printf("Target Velocity      = %3.1f miles/hour\n", targetV*0.62137121212121)
-	} else {
-		fmt.Printf("Target Velocity      = %3.1f kilometers/hour\n", targetV)
-	}
+	fmt.Printf("Target Velocity      = %3.1f %s/hour\n", getMilesOrKilometers(targetVkph*metersPerKilometer, englishUnits), milesOrKilometers[englishUnits])
 	fmt.Printf("Target Velocity      = %s/sec\n", getDisplayText(targetVmps))
+	fmt.Printf("Current Target Range = %3.1f %s\n", getMilesOrKilometers(targetRange, englishUnits), milesOrKilometers[englishUnits])
 	fmt.Printf("Current Target Range = %s\n", getDisplayText(targetRange))
 	fmt.Println("----------------------------------")
 }
 
-func getImpactTimeline(shotDistance, targetDistance, maxDistance float64, hit bool) (impactString [2]string) {
-	flightPath := 0
-	impactPath := 1
-	impactString[flightPath] = " /~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-	impactString[impactPath] = "/--------+---------+---------+---------+----------|"
-	maxString := len(impactString[impactPath]) - 1
-	targetIndex := int(targetDistance/maxDistance*float64(maxString)) + 1
-	shotIndex := int(shotDistance/maxDistance*float64(maxString)) + 1
-	if hit {
-		if targetIndex < 4 {
-			targetIndex = 4
+func getImpactTimelineIndices(shotDistance, targetDistance, maxDistance float64) (shotIndex, targetIndex int) {
+	maxString := len(impactPath) - 1
+	targetIndex = int(targetDistance/maxDistance*float64(maxString)) + 1
+	shotIndex = int(shotDistance/maxDistance*float64(maxString)) + 1
+	if shotIndex == targetIndex {
+		if shotDistance < targetDistance {
+			shotIndex = targetIndex - 1
+		} else {
+			shotIndex = targetIndex + 1
 		}
-		impactString[flightPath] = impactString[flightPath][:targetIndex-2] + "\\"
-		impactString[impactPath] = impactString[impactPath][:targetIndex-1] + "*" + impactString[impactPath][targetIndex:]
-	} else {
-		if shotIndex == targetIndex {
-			if shotDistance < targetDistance {
-				shotIndex = targetIndex - 1
-			} else {
-				shotIndex = targetIndex + 1
-			}
-		}
-		if shotIndex < 4 || targetIndex < 5 {
-			if shotIndex < 4 && targetIndex < 5 {
-				if targetIndex < shotIndex {
-					shotIndex += 4 - shotIndex
-					targetIndex = int(math.Max(2, float64(targetIndex)))
-				} else {
-					inc := int(math.Max(4-float64(shotIndex), 5-float64(targetIndex)))
-					shotIndex += inc
-					targetIndex += inc
-				}
-			} else if shotIndex < 4 {
+	}
+	if shotIndex < 4 || targetIndex < 5 {
+		if shotIndex < 4 && targetIndex < 5 {
+			if targetIndex < shotIndex {
 				shotIndex += 4 - shotIndex
-			} else { // targetIndex < 5
 				targetIndex = int(math.Max(2, float64(targetIndex)))
+			} else {
+				inc := int(math.Max(4-float64(shotIndex), 5-float64(targetIndex)))
+				shotIndex += inc
+				targetIndex += inc
 			}
+		} else if shotIndex < 4 {
+			shotIndex += 4 - shotIndex
+		} else { // targetIndex < 5
+			targetIndex = int(math.Max(2, float64(targetIndex)))
 		}
-		impactString[flightPath] = impactString[flightPath][:shotIndex-2] + "\\"
-		impactString[impactPath] = impactString[impactPath][:shotIndex-1] + "\\" + impactString[impactPath][shotIndex:]
-		impactString[impactPath] = impactString[impactPath][:targetIndex-1] + "T" + impactString[impactPath][targetIndex:]
 	}
 	return
 }
 
 func printImpactTimeline(shotDistance float64, hit bool) {
 
-	impactStrings := getImpactTimeline(shotDistance, targetRange, maxRange, hit)
-
-	fmt.Println("")
-	for _, impactString := range impactStrings {
-		fmt.Println(impactString)
+	shotIndex, targetIndex := getImpactTimelineIndices(shotDistance, targetRange, maxRange)
+	curFlightPath := flightPath
+	curImpactPath := impactPath
+	if hit {
+		curFlightPath = curFlightPath[:targetIndex-2] + "\\"
+		curImpactPath = curImpactPath[:targetIndex-1] + "*" + curImpactPath[targetIndex:]
+	} else {
+		curFlightPath = curFlightPath[:shotIndex-2] + "\\"
+		curImpactPath = curImpactPath[:shotIndex-1] + "\\" + curImpactPath[shotIndex:]
+		curImpactPath = curImpactPath[:targetIndex-1] + "T" + curImpactPath[targetIndex:]
 	}
+	fmt.Println("")
+	fmt.Println(curFlightPath)
+	fmt.Println(curImpactPath)
+	fmt.Println(rulerText)
 	fmt.Println("")
 }
 
-func printImpactResults(shotRange, shotDelta float64, shotCount int) bool {
+func printImpactResults(shotRange, targetRange, shotDelta, deathRadius float64, shotCount int) bool {
 	fmt.Printf("Target Range = %s at time of impact.\n", getDisplayText(targetRange))
 	if math.Abs(shotDelta) <= deathRadius {
 		printImpactTimeline(shotRange, true)
 		fmt.Println("")
-		fmt.Println("Direct hit after", shotCount, "shots!!")
+		fmt.Printf("Direct hit (within %s) after %d shots!!\n", getDisplayText(math.Abs(shotDelta)), shotCount)
 		fmt.Println("")
 		return true
-	} else if targetRange <= deathRadius {
-		fmt.Println("")
-		fmt.Println(gameOverMan)
-		fmt.Println("")
+	} else if isGameOverMan(targetRange, deathRadius) {
 		return true
 	} else {
 		if shotDelta > 0.0 {
@@ -182,37 +254,77 @@ func printImpactResults(shotRange, shotDelta float64, shotCount int) bool {
 	return false
 }
 
-func singlePlayer() {
-	shotCount := 0
-	var shotAngle float64
-	for {
-		printHeader()
+func isGameOverMan(targetRange, deathRadius float64) bool {
+	if targetRange <= deathRadius {
+		fmt.Println("")
+		fmt.Println(gameOverMan)
+		fmt.Println("")
+		return true
+	}
+	return false
+}
 
-		goodValue := false
-		for !goodValue {
-			fmt.Printf("Enter a shot angle from %3.1f to %3.1f degrees:\n", minShotAngle, maxShotAngle)
-			_, err := fmt.Scanf("%f\n", &shotAngle)
-			if err != nil {
-				fmt.Println(err)
-			} else {
-				if shotAngle >= 0.0 && shotAngle <= 45.0 {
-					if shotAngle == 0.0 {
-						return
-					}
-					goodValue = true
-				}
+func takeShot(shotCount int, shotAngle, projectileVmps float64) (shotRange, shotTime, shotDelta float64) {
+	shotRange, shotTime = xRange(shotAngle, projectileVmps)
+	fmt.Printf("Taking shot #%d at %4.2f degrees. Flight time is %3.1f seconds.\n", shotCount, shotAngle, shotTime)
+	if targetModeAuto {
+		// Wait here so that the target has time to move in targetMovement() during the shot.
+		time.Sleep(time.Second * time.Duration(shotTime) / time.Duration(targetSpeedMultiplier))
+	} else {
+		// Fast forward the target to the correct location.
+		targetRange -= targetVmps * shotTime
+	}
+	fmt.Printf("Shot #%d took %3.1f seconds, and went %s (%3.1f %s).\n", shotCount, shotTime, getDisplayText(shotRange), getMilesOrKilometers(shotRange, englishUnits), milesOrKilometers[englishUnits])
+	shotDelta = targetRange - shotRange
+	return
+}
+
+func getNextShotAngle(reader io.Reader) float64 {
+	scanner := bufio.NewScanner(reader)
+	for {
+		fmt.Printf("Enter a shot angle from %3.1f to %3.1f degrees (0 to quit): ", minShotAngle, maxShotAngle)
+		scanner.Scan()
+		input := scanner.Text()
+		if shotAngle, err := strconv.ParseFloat(input, 64); err == nil {
+			if shotAngle >= 0.0 && shotAngle <= maxShotAngle {
+				return shotAngle
 			}
 		}
+		fmt.Printf("  Invalid Value: `%s`\n", input)
+	}
+}
 
+func predictNextShotAngle(shotRange, shotTime, shotDelta float64) float64 {
+	predictedLocation := shotRange + shotDelta - ((targetVmps * 0.95) * (shotTime * 0.95))
+	predictedAngle := xAngle(predictedLocation, projectileVmps)
+	if math.IsNaN(predictedAngle) {
+		predictedAngle = maxShotAngle
+	}
+	return math.Max(math.Min(predictedAngle, maxShotAngle), minShotAngle)
+}
+
+func battleManager() {
+	defer wg.Done()
+
+	shotAngle := 0.0
+	predictedShotAngle := maxShotAngle / 2.0
+	shotCount := 0
+	for {
+		printHeader()
+		if shootModeAuto {
+			shotAngle = predictedShotAngle
+		} else {
+			shotAngle = getNextShotAngle(os.Stdin)
+			if shotAngle == 0.0 {
+				return
+			}
+		}
 		shotCount++
-		shotRange, shotTime := xRange(shotAngle, projectileV)
-		fmt.Printf("Taking shot #%d at %4.2f degrees.\n", shotCount, shotAngle)
-		fmt.Printf("Shot #%d took %3.1f seconds, and went %s.\n", shotCount, shotTime, getDisplayText(shotRange))
-		targetRange -= targetVmps * shotTime
-		shotDelta := targetRange - shotRange
-		if printImpactResults(shotRange, shotDelta, shotCount) {
+		shotRange, shotTime, shotDelta := takeShot(shotCount, shotAngle, projectileVmps)
+		if printImpactResults(shotRange, targetRange, shotDelta, deathRadius, shotCount) {
 			return
 		}
+		predictedShotAngle = predictNextShotAngle(shotRange, shotTime, shotDelta)
 	}
 }
 
@@ -221,54 +333,28 @@ func targetMovement() {
 
 	movementCount := 0
 	for {
-		time.Sleep(time.Second / time.Duration(gameSpeed))
+		time.Sleep(time.Second / time.Duration(targetSpeedMultiplier))
 		targetRange -= targetVmps
 		movementCount++
 		if (movementCount % 10) == 0 {
-			fmt.Printf("Target Range = %s after %d seconds.\n", getDisplayText(targetRange), 10)
+			note := ""
+			if targetSpeedMultiplier > 1 {
+				note = fmt.Sprintf(" (at %dx real-time)", targetSpeedMultiplier)
+			}
+			fmt.Printf("Target Range = %s after %d seconds%s.\n", getDisplayText(targetRange), 10, note)
 		}
-		if targetRange < deathRadius {
-			fmt.Println("")
-			fmt.Println(gameOverMan)
-			fmt.Println("")
+		if isGameOverMan(targetRange, deathRadius) {
 			return
 		}
-	}
-}
-
-func battleManager() {
-	defer wg.Done()
-
-	shotAngle := maxShotAngle / 2.0
-	shotCount := 0
-	for {
-		printHeader()
-		shotCount++
-		shotRange, shotTime := xRange(shotAngle, projectileV)
-		fmt.Printf("Taking shot #%d at %4.2f degrees.\n", shotCount, shotAngle)
-		time.Sleep(time.Second * time.Duration(shotTime) / time.Duration(gameSpeed))
-		fmt.Printf("Shot #%d took %3.1f seconds, and went %s.\n", shotCount, shotTime, getDisplayText(shotRange))
-		shotDelta := targetRange - shotRange
-		if printImpactResults(shotRange, shotDelta, shotCount) {
-			return
-		}
-		predictedShotDelta := shotDelta - (targetVmps * shotTime)
-		shotAngleDelta := maxShotAngle * (predictedShotDelta / maxRange)
-		shotAngle += shotAngleDelta
-		shotAngle = math.Max(math.Min(shotAngle, maxShotAngle), minShotAngle)
 	}
 }
 
 func main() {
-	if playModeAuto {
-		wg.Add(1)
+	initialize()
+	wg.Add(1)
+	if targetModeAuto {
 		go targetMovement()
-		go battleManager()
-		wg.Wait()
-	} else {
-		if !playModePauseTarget {
-			go targetMovement()
-		}
-		singlePlayer()
 	}
+	go battleManager()
+	wg.Wait()
 }
